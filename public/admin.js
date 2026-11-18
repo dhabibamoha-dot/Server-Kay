@@ -15,6 +15,10 @@
     lines: 'اللاينات', pin: 'التثبيت', fps: 'رفع الفريمات', colors: 'الألوان',
     macro: 'الماكرو', clip: 'تسجيل الشاشة', alerts: 'تنبيهات الحجم',
     profiles: 'البروفايلات', recorder: 'مسجّل الحزم',
+    colors_premium: '⭐ ألوان مميزة (حر + قوس قزح + لكل صفحة)',
+    rank: '⭐ رتبة بجانب الاسم', icons: '⭐ أيقونات اللعبة في الشات',
+    skins: '⭐ رفع سكنات مخصصة', phys: '⭐ محرك التصويب الذكي (فيزياء)',
+    respawn: '⭐ ريسبون تلقائي',
   };
   const LOG_LABELS = {
     login_success: ['دخول ناجح', 'good'],
@@ -831,11 +835,58 @@
           '<dt>عدد الأكواد</dt><dd>' + num(STATE.codes.length) + '</dd>' +
         '</dl>' +
       '</div>' +
+      '<div class="card">' +
+        '<div class="card-head"><div class="card-title"><span class="ico">🌐</span>عنوان السيرفر الحالي</div></div>' +
+        '<div class="card-sub">السكريبتات المنصبة بتحاول تقرأ العنوان ده من هنا كل ما تقدر توصله، عشان لو عنوان الاستضافة اتغيّر (زي ما بيحصل مع Railway/Render أحيانًا) تعرف تلاقي السيرفر الجديد من غير ما تحتاج تحدّث كل نسخة يدويًا — بشرط إن العنوان القديم يفضل شغال شوية بعد النقل.</div>' +
+        '<label class="field">عنوان السيرفر (مثال: https://xxx.up.railway.app)<input id="cfg_url" placeholder="https://..." style="direction:ltr"></label>' +
+        '<div class="row"><span class="spacer"></span><button class="btn primary" id="cfgSave">حفظ العنوان</button></div>' +
+      '</div>' +
+      '<div class="card">' +
+        '<div class="card-head"><div class="card-title"><span class="ico">🔒</span>توزيع السكريبت (نسخة مشفّرة)</div></div>' +
+        '<div class="card-sub">ارفع نسخة السكريبت النهائية هنا. السيرفر هيولّد نسختين: نسخة مشفّرة (رابط تشاركه مع المستخدمين، بتشتغل بالظبط زي الأصلية بس مش مقروءة في محرر Tampermonkey) ونسخة أصلية تقدر تنزلها إنت بس للتعديل. ملحوظة أمانة: مفيش تشفير JS في المتصفح "مستحيل الفك" فعليًا — اللي بيحصل هنا إخفاء قوي (gzip + XOR) مش قراءة مباشرة، مش حماية نهائية 100%.</div>' +
+        '<label class="field">ملف السكريبت (.user.js)<input id="dist_file" type="file" accept=".js,.user.js"></label>' +
+        '<div class="row" id="dist_meta" style="gap:10px"></div>' +
+        '<div class="row"><span class="spacer"></span><button class="btn primary" id="distSave">رفع وتشفير</button></div>' +
+        '<div class="row" id="dist_links" style="gap:10px;display:none">' +
+          '<a class="btn ghost" id="dist_obf_link" target="_blank">🔗 رابط النسخة المشفّرة (للمشاركة)</a>' +
+          '<a class="btn ghost" id="dist_plain_link" target="_blank">⬇ تنزيل النسخة الأصلية (لك فقط)</a>' +
+        '</div>' +
+      '</div>' +
       '<div class="card" style="border-color:rgba(255,111,139,.3)">' +
         '<div class="card-head"><div class="card-title"><span class="ico" style="background:rgba(255,111,139,.12);border-color:rgba(255,111,139,.3)">⚠</span>منطقة الخطر</div></div>' +
         '<div class="card-sub">تسجيل الخروج من كل مكان بيوقف الجلسة الحالية بس (التوكن HMAC مش بيتخزن على السيرفر). لإيقاف كل الأجهزة استعمل «إلغاء» على الكود.</div>' +
         '<div class="row"><button class="btn danger" id="logoutAll">تسجيل الخروج من هنا</button></div>' +
       '</div>';
+
+    api('/api/admin/config').then((c) => { const el = $('#cfg_url', host); if (el) el.value = c.serverUrl || location.origin; }).catch(() => { });
+    $('#cfgSave', host).onclick = async () => {
+      try { await api('/api/admin/config', { method: 'POST', body: { serverUrl: $('#cfg_url', host).value.trim() } }); toast('اتحفظ عنوان السيرفر'); }
+      catch (_) { toast('فشل الحفظ', 'bad'); }
+    };
+
+    function refreshDist() {
+      api('/api/admin/script').then((r) => {
+        const meta = $('#dist_meta', host), links = $('#dist_links', host);
+        if (r.current) {
+          meta.innerHTML = 'النسخة الحالية: v' + esc(r.current.version || '؟') + ' · ' + Math.round((r.current.size || 0) / 1024) + ' كيلوبايت · ' + new Date(r.current.updatedAt).toLocaleString('ar-EG');
+          links.style.display = '';
+          $('#dist_obf_link', host).href = location.origin + '/api/script/obfuscated';
+          $('#dist_plain_link', host).href = location.origin + '/api/admin/script/plain?token=' + encodeURIComponent(TOKEN);
+        } else { meta.innerHTML = 'لسه مفيش نسخة مرفوعة.'; links.style.display = 'none'; }
+      }).catch(() => { });
+    }
+    refreshDist();
+    $('#distSave', host).onclick = async () => {
+      const f = $('#dist_file', host).files[0];
+      if (!f) return toast('اختار ملف الأول', 'bad');
+      const buf = await f.arrayBuffer();
+      const b64 = btoa(Array.from(new Uint8Array(buf)).map((b) => String.fromCharCode(b)).join(''));
+      try {
+        await api('/api/admin/script', { method: 'POST', body: { content: b64, filename: f.name } });
+        toast('اترفع واتشفّر بنجاح');
+        refreshDist();
+      } catch (e) { toast(e.data && e.data.error === 'not_a_userscript' ? 'الملف مش سكريبت صحيح' : 'فشل الرفع', 'bad'); }
+    };
 
     $('#pwdSave', host).onclick = async () => {
       const now = $('#pwd_now', host).value, a = $('#pwd_new', host).value, b = $('#pwd_new2', host).value;

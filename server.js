@@ -140,6 +140,8 @@ function defaultPermissions() {
   return {
     lines: true, pin: true, fps: true, colors: true,
     macro: true, clip: true, alerts: true, profiles: true, recorder: true,
+    // Premium extras: OFF by default, an admin turns them on per code.
+    colors_premium: false, rank: false, icons: false, skins: false, phys: false, respawn: false,
   };
 }
 function clampInt(v, lo, hi, def) {
@@ -173,9 +175,12 @@ async function ensureAdmin() {
   console.log(' (set ADMIN_USER / ADMIN_PASS env vars next run to pick your own)');
   console.log('================================================');
 }
-async function requireAdmin(req) {
+async function requireAdmin(req, url) {
   const hdr = String(req.headers['authorization'] || '');
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  let token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  // A plain <a href> download can't set an Authorization header, so the one
+  // admin-only file-download link is also allowed to pass ?token= instead.
+  if (!token && url) { try { token = url.searchParams.get('token') || null; } catch (_) { } }
   const payload = token && auth.verify(token);
   if (!payload || payload.role !== 'admin') return null;
   return payload;
@@ -337,6 +342,142 @@ route('GET', /^\/api\/update\/download$/, async (req, res, m, body, url) => {
   };
   res.writeHead(200, baseHeaders(headers));
   res.end(buf);
+});
+
+// ── runtime config (public) ──────────────────────────────────────────────
+// A userscript's own localStorage copy of "which server to talk to" can get
+// stuck pointing at a dead URL after a redeploy (Railway/Render free tiers
+// sometimes change their generated URL). As long as the OLD url is still
+// reachable at least once after the move, this lets it learn the NEW one and
+// remember it for next time - it cannot help a url that is already 404ing
+// with nothing listening, that case still needs a fresh script build via the
+// update channel above.
+const CONFIG_COLL = 'config';
+const CONFIG_ID = 'runtime';
+async function getConfig() {
+  try { return (await db.collection(CONFIG_COLL).findOne({ _id: CONFIG_ID })) || {}; } catch (_) { return {}; }
+}
+route('GET', /^\/api\/config$/, async (req, res) => {
+  const cfg = await getConfig();
+  send(res, 200, { ok: true, serverUrl: cfg.serverUrl || null, motd: cfg.motd || null, updatedAt: cfg.updatedAt || null });
+});
+route('GET', /^\/api\/admin\/config$/, async (req, res) => {
+  if (!(await requireAdmin(req))) return send(res, 401, { ok: false, error: 'unauthorized' });
+  const cfg = await getConfig();
+  send(res, 200, { ok: true, serverUrl: cfg.serverUrl || '', motd: cfg.motd || '' });
+});
+route('POST', /^\/api\/admin\/config$/, async (req, res, m, body) => {
+  const p = await requireAdmin(req);
+  if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+  const set = { updatedAt: Date.now() };
+  if (body.serverUrl !== undefined) set.serverUrl = String(body.serverUrl || '').trim().replace(/\/+$/, '');
+  if (body.motd !== undefined) set.motd = String(body.motd || '').slice(0, 500);
+  const existing = await getConfig();
+  if (existing && existing._id) {
+    await db.collection(CONFIG_COLL).updateOne({ _id: CONFIG_ID }, { $set: set });
+  } else {
+    await db.collection(CONFIG_COLL).insertOne(Object.assign({ _id: CONFIG_ID }, set));
+  }
+  await log('config_updated', { by: p.username, serverUrl: set.serverUrl });
+  send(res, 200, { ok: true });
+}, { auth: true });
+
+// ── script distribution: plain (admin-only) + obfuscated (shareable) ──────
+// Separate from the auto-update channel above on purpose: this is the copy an
+// admin hands out by link to end users, so it must look encrypted in the
+// Tampermonkey editor while running byte-identical to the plain source.
+// NOTE: true "impossible to crack" obfuscation of client-side JS does not
+// exist - the browser has to be able to run it, so anyone with enough time
+// can always get back to working code. What this does is gzip+XOR+base64 the
+// script body behind a tiny loader stub, which stops a casual look in the
+// Tampermonkey editor from reading anything, without being a false promise.
+const SCRIPT_COLL = 'script_dist';
+const SCRIPT_ID = 'current';
+function obfuscateUserscript(plainText) {
+  const headerMatch = /^([\s\S]*?\/\/\s*==\/UserScript==\s*\n)/.exec(plainText);
+  const header = headerMatch ? headerMatch[1] : '// ==UserScript==\n// ==/UserScript==\n';
+  const body = plainText.slice(header.length);
+  const gz = zlib.gzipSync(Buffer.from(body, 'utf8'));
+  const key = crypto.createHash('sha256').update('nm-dist-' + (process.env.NM_DIST_KEY || 'default')).digest();
+  const xored = Buffer.alloc(gz.length);
+  for (let i = 0; i < gz.length; i++) xored[i] = gz[i] ^ key[i % key.length];
+  const b64 = xored.toString('base64');
+  // Split into chunks so it doesn't read as one giant suspicious line, and so
+  // very large scripts don't hit any single-string engine limits.
+  const chunks = [];
+  for (let i = 0; i < b64.length; i += 2000) chunks.push(b64.slice(i, i + 2000));
+  const loader = `
+(function(){
+  var __d="${chunks.join('"+"')}";
+  try {
+    var bin = Uint8Array.from(atob(__d), function(c){ return c.charCodeAt(0); });
+    var keyHex = "${key.toString('hex')}";
+    var key = new Uint8Array(keyHex.length/2);
+    for (var i=0;i<key.length;i++) key[i]=parseInt(keyHex.substr(i*2,2),16);
+    var xo = new Uint8Array(bin.length);
+    for (var i=0;i<bin.length;i++) xo[i]=bin[i]^key[i%key.length];
+    var ds = new DecompressionStream('gzip');
+    var stream = new Blob([xo]).stream().pipeThrough(ds);
+    new Response(stream).text().then(function(src){
+      (0, eval)(src);
+    });
+  } catch (e) { console.error('[nm] تعذر تشغيل النسخة المشفّرة', e); }
+})();
+`;
+  return header + loader;
+}
+async function getScriptDist() {
+  try { return (await db.collection(SCRIPT_COLL).findOne({ _id: SCRIPT_ID })) || null; } catch (_) { return null; }
+}
+route('GET', /^\/api\/admin\/script$/, async (req, res) => {
+  if (!(await requireAdmin(req))) return send(res, 401, { ok: false, error: 'unauthorized' });
+  const doc = await getScriptDist();
+  send(res, 200, { ok: true, current: doc ? { version: doc.version, filename: doc.filename, size: doc.size, updatedAt: doc.updatedAt, updatedBy: doc.updatedBy } : null });
+});
+route('POST', /^\/api\/admin\/script$/, async (req, res, m, body) => {
+  const p = await requireAdmin(req);
+  if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+  if (!body || !body.content) return send(res, 400, { ok: false, error: 'missing_file' });
+  let buf;
+  try { buf = Buffer.from(String(body.content), 'base64'); } catch (_) { return send(res, 400, { ok: false, error: 'bad_base64' }); }
+  if (!buf.length || buf.length > MAX_UPDATE_BYTES) return send(res, 400, { ok: false, error: 'bad_size' });
+  const text = buf.toString('utf8');
+  if (!/==UserScript==/.test(text.slice(0, 4000))) return send(res, 400, { ok: false, error: 'not_a_userscript' });
+  const obf = obfuscateUserscript(text);
+  const doc = {
+    _id: SCRIPT_ID,
+    version: detectVersion(text) || '',
+    filename: String(body.filename || 'nightmare-controller.user.js').slice(0, 120),
+    size: buf.length,
+    plain: buf.toString('base64'),
+    obfuscated: Buffer.from(obf, 'utf8').toString('base64'),
+    updatedAt: Date.now(),
+    updatedBy: p.username,
+  };
+  const existing = await getScriptDist();
+  if (existing) await db.collection(SCRIPT_COLL).updateOne({ _id: SCRIPT_ID }, { $set: doc });
+  else await db.collection(SCRIPT_COLL).insertOne(doc);
+  await log('script_dist_updated', { by: p.username, version: doc.version, size: doc.size });
+  send(res, 200, { ok: true, version: doc.version, size: doc.size });
+}, { auth: true, limit: MAX_UPDATE_BYTES * 2 });
+function sendUserscriptFile(res, buf, filename) {
+  res.writeHead(200, baseHeaders({
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Disposition': 'inline; filename="' + filename.replace(/[^A-Za-z0-9._\-]/g, '_') + '"',
+    'Cache-Control': 'no-store',
+  }));
+  res.end(buf);
+}
+route('GET', /^\/api\/script\/obfuscated$/, async (req, res) => {
+  const doc = await getScriptDist();
+  if (!doc || !doc.obfuscated) return send(res, 404, 'no script published');
+  sendUserscriptFile(res, Buffer.from(doc.obfuscated, 'base64'), doc.filename || 'nightmare-controller.user.js');
+});
+route('GET', /^\/api\/admin\/script\/plain$/, async (req, res, m, body, url) => {
+  if (!(await requireAdmin(req, url))) return send(res, 401, { ok: false, error: 'unauthorized' });
+  const doc = await getScriptDist();
+  if (!doc || !doc.plain) return send(res, 404, 'no script published');
+  sendUserscriptFile(res, Buffer.from(doc.plain, 'base64'), (doc.filename || 'nightmare-controller.user.js').replace(/\.user\.js$/, '.source.user.js'));
 });
 
 // ── admin auth ──
